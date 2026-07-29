@@ -1,0 +1,3 @@
+# Flotila zařízení pro release install — lokální IP a HW serialy nepatří do veřejného repa.
+# Vzor je v devices.example.ps1.
+devices.ps1
