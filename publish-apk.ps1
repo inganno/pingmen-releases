@@ -64,4 +64,4 @@ if (-not $KeepOld) {
 
 Write-Host ""
 Write-Host "Hotovo. Verejny download: https://github.com/$repo/releases/latest/download/pingmen.apk"
-Write-Host "Web (po deployi): https://test.pingmen.games/download/apk"
+Write-Host "Web (po deployi): https://pingmen.games/download/apk"
