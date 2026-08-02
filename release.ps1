@@ -32,12 +32,19 @@
 .EXAMPLE
   .\release.ps1 -SkipBuild -NoInstall
   Jen publikace posledního postaveného APK na web.
+
+.EXAMPLE
+  .\release.ps1 -Aab
+  Store režim. Postaví .aab pro Play Console a hned za ním .apk se STEJNÝM versionCode,
+  které rozešle na flotilu k retestu (AAB přes adb nainstalovat nelze). Na web nepublikuje —
+  store build tam patří až po retestu, samostatným během `-SkipBuild -NoInstall`.
 #>
 param(
   [string[]]$Device = @(),  # cílová zařízení (IP:port nebo USB serial); prázdné = flotila z devices.ps1
   [switch]$NoInstall,       # přeskočit rozesílání na zařízení
   [switch]$NoPublish,       # přeskočit publikaci na web
-  [switch]$SkipBuild        # přeskočit build (jen install/publish existujícího pingmen-release-*.apk)
+  [switch]$SkipBuild,       # přeskočit build (jen install/publish existujícího pingmen-release-*.apk)
+  [switch]$Aab              # store režim: AAB do Play + APK se STEJNÝM versionCode na retest flotily
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +55,7 @@ $Keystore  = "$env:USERPROFILE\.pingmen-keys\pingmen-release.keystore"
 $BuildsDir = Join-Path $UnityProj "Builds"
 $Log       = Join-Path $BuildsDir "unity-build.log"
 $ApkOut    = Join-Path $BuildsDir ("pingmen-release-" + (Get-Date -Format "yyyy-MM-dd") + ".apk")
+$AabOut    = Join-Path $BuildsDir ("pingmen-release-" + (Get-Date -Format "yyyy-MM-dd") + ".aab")
 $Package   = "com.inganno.pingmen"
 
 function Read-Plain([string]$prompt) {
@@ -83,6 +91,32 @@ function Get-AdbState([string]$serial) {
     if ($parts.Count -ge 2 -and $parts[0] -eq $serial) { return $parts[1] }
   }
   return ""
+}
+
+# Jeden Unity batchmode build. Unity.exe je GUI-subsystem → odpojí se od PowerShellu a běží dál
+# na pozadí, takže se čeká na zmizení procesu A vznik výstupu; log se průběžně kontroluje na chybu,
+# jinak by se při failu čekalo donekonečna.
+function Invoke-UnityBuild([string]$method, [string]$outPath, [string]$label) {
+  Remove-Item $outPath -ErrorAction SilentlyContinue
+  Remove-Item $Log -ErrorAction SilentlyContinue
+  if ($method -eq "AndroidReleaseBundle") { $env:PINGMEN_AAB_OUT = $outPath }
+  else                                    { $env:PINGMEN_APK_OUT = $outPath }
+
+  Write-Host "Building $label (~3 min)..." -ForegroundColor Cyan
+  & $Unity -batchmode -nographics -projectPath $UnityProj -buildTarget Android `
+    -executeMethod "Pingmen.Editor.BuildScript.$method" -logFile $Log -quit | Out-Null
+
+  while ($true) {
+    Start-Sleep -Seconds 3
+    if ((Test-Path $Log) -and (Select-String -Path $Log -Pattern "Build Failed|error CS\d|Release build vyžaduje" -Quiet -ErrorAction SilentlyContinue)) {
+      throw "Build SELHAL ($label) — viz $Log (špatné heslo/alias?)."
+    }
+    $running = Get-Process Unity -ErrorAction SilentlyContinue
+    if (-not $running -and (Test-Path $outPath)) { break }
+    if (-not $running -and -not (Test-Path $outPath)) { throw "Unity skončil, ale výstup nevznikl ($label) — viz $Log." }
+  }
+  $sizeMB = [math]::Round((Get-Item $outPath).Length / 1MB, 1)
+  Write-Host "OK: $outPath ($sizeMB MB)" -ForegroundColor Green
 }
 
 function Get-InstalledVersionCode([string]$target) {
@@ -130,32 +164,24 @@ if (-not $SkipBuild) {
   $env:PINGMEN_KEYSTORE_PASS = $ksPass
   $env:PINGMEN_KEYALIAS_NAME = $alias
   $env:PINGMEN_KEYALIAS_PASS = $alPass
-  $env:PINGMEN_APK_OUT       = $ApkOut
+  # Výstupní cestu (PINGMEN_APK_OUT / PINGMEN_AAB_OUT) nastavuje Invoke-UnityBuild podle metody.
   # Avast SSL inspection → Unity/Gradle cacerts neznají Avast cert; použij Windows-ROOT store (viz build-tv.ps1).
   $env:JAVA_TOOL_OPTIONS     = "-Djavax.net.ssl.trustStoreType=Windows-ROOT -Djavax.net.ssl.trustStore=NUL"
 
-  Remove-Item $ApkOut -ErrorAction SilentlyContinue
-  Remove-Item $Log -ErrorAction SilentlyContinue
-  Write-Host "Building signed IL2CPP release (~3 min)..." -ForegroundColor Cyan
-  & $Unity -batchmode -nographics -projectPath $UnityProj -buildTarget Android `
-    -executeMethod Pingmen.Editor.BuildScript.AndroidRelease -logFile $Log -quit | Out-Null
-
-  # Unity.exe je GUI-subsystem → odpojí se od PowerShellu, build běží na pozadí. Čekej až zmizí proces
-  # A vznikne APK; průběžně kontroluj log na chybu (jinak by se čekalo do nekonečna).
-  while ($true) {
-    Start-Sleep -Seconds 3
-    if ((Test-Path $Log) -and (Select-String -Path $Log -Pattern "Build Failed|error CS\d|Release build vyžaduje" -Quiet -ErrorAction SilentlyContinue)) {
-      throw "Build SELHAL — viz $Log (špatné heslo/alias?)."
-    }
-    $running = Get-Process Unity -ErrorAction SilentlyContinue
-    if (-not $running -and (Test-Path $ApkOut)) { break }
-    if (-not $running -and -not (Test-Path $ApkOut)) { throw "Unity skončil, ale APK nevzniklo — viz $Log." }
+  # Store režim staví DVAKRÁT nad stejným kódem: .aab do Play a .apk na retest flotily.
+  # Druhý běh má PINGMEN_SKIP_VERSION_BUMP=1, takže oba nesou TÝŽ versionCode — jinak by se
+  # na zařízeních testoval jiný build, než jaký jde do Console. AAB přes adb nainstalovat nelze.
+  if ($Aab) {
+    Invoke-UnityBuild "AndroidReleaseBundle" $AabOut "AAB pro Google Play"
+    $env:PINGMEN_SKIP_VERSION_BUMP = "1"
+    Invoke-UnityBuild "AndroidRelease" $ApkOut "APK na retest (týž versionCode)"
+    Remove-Item Env:PINGMEN_SKIP_VERSION_BUMP -ErrorAction SilentlyContinue
+  } else {
+    Invoke-UnityBuild "AndroidRelease" $ApkOut "APK"
   }
 
   # Vymaž hesla z env (ať nezůstanou v session).
   Remove-Item Env:PINGMEN_KEYSTORE_PASS, Env:PINGMEN_KEYALIAS_PASS -ErrorAction SilentlyContinue
-  $sizeMB = [math]::Round((Get-Item $ApkOut).Length / 1MB, 1)
-  Write-Host "OK: $ApkOut ($sizeMB MB)" -ForegroundColor Green
 }
 
 # APK, které se rozesílá a publikuje.
@@ -243,7 +269,14 @@ if (-not $NoInstall) {
 # --- Publikace na web ----------------------------------------------------------------------
 
 $publishState = "přeskočeno"
-if (-not $NoPublish) {
+if ($Aab -and -not $NoPublish) {
+  # Store build se na veřejný download nevysype sám — nese targetSdk 35, který se teprve retestuje
+  # na flotile. Publikace je vědomý druhý krok: release.ps1 -SkipBuild -NoInstall
+  Write-Host ""
+  Write-Host "Store režim → publikace na web PŘESKOČENA (AAB na web nepatří, APK čeká na retest)." -ForegroundColor Yellow
+  $publishState = "přeskočeno (store režim)"
+}
+elseif (-not $NoPublish) {
   Write-Host ""
   $failed = @($results | Where-Object { $_.Vysledek -eq "SELHALO" })
   if ($failed.Count -gt 0) {
@@ -263,10 +296,14 @@ if (-not $NoPublish) {
 
 Write-Host ""
 Write-Host "=== SOUHRN ===" -ForegroundColor Cyan
+if ($Aab -and -not $SkipBuild) { Write-Host "AAB: $AabOut   ← tohle nahraj do Play Console" -ForegroundColor Green }
 Write-Host "APK: $Apk"
 if ($results.Count -gt 0) { $results | Format-Table -AutoSize | Out-Host }
 Write-Host "Web publish: $publishState"
 Write-Host ""
 if (-not $SkipBuild) {
   Write-Host "→ Nezapomeň COMMITNOUT versionCode bump v Pingmen-unity/ProjectSettings.asset (release ho zvýšil)." -ForegroundColor Yellow
+}
+if ($Aab -and -not $SkipBuild) {
+  Write-Host "→ AAB i APK nesou TÝŽ versionCode — co doretestuješ na flotile, to jde do Console." -ForegroundColor Yellow
 }
